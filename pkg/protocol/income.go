@@ -1,15 +1,15 @@
 package protocol
 
 import (
-	"encoding/binary"
-	"encoding/hex"
+	"errors"
+	"fmt"
 )
 
-type Income struct {
-	Type     uint32             `json:"type"`
-	ReqLogID []byte             `json:"req_log_id"`
-	SenderID [ClientIDSize]byte `json:"sender_id"`
-	Payload  []byte             `json:"payload"`
+type ServerMessage struct {
+	Type      ServerMessageType   `json:"type"`
+	RequestID [RequestIDSize]byte `json:"req_log_id"`
+	SenderID  [ClientIDSize]byte  `json:"sender_id"`
+	Payload   []byte              `json:"payload"`
 }
 
 type Status string
@@ -21,48 +21,65 @@ const (
 	StatusNotFound Status = "Not found"
 )
 
-func (i Income) Mashal() ([]byte, error) {
-	out := make([]byte, 8+len(i.ReqLogID)+len(i.SenderID)+len(i.Payload))
-	var tail int
-	binary.BigEndian.PutUint32(out[:4], i.Type)
-	tail += 4
-	binary.BigEndian.PutUint32(out[tail:], uint32(len(i.ReqLogID)))
-	tail += 4
-	tail += copy(out[tail:], i.ReqLogID)
-	tail += copy(out[tail:], i.SenderID[:])
-	copy(out[tail:], i.Payload)
+func (i ServerMessage) Mashal() []byte {
+	mlen := 1 + RequestIDSize
+	if i.Type == Income {
+		mlen += ClientIDSize + len(i.Payload)
+	}
+	out := make([]byte, mlen)
+	out[0] = byte(i.Type)
+	tail := copy(out[1:], i.RequestID[:])
 
-	return out, nil
+	if i.Type == Income {
+		tail = copy(out[tail:], i.SenderID[:])
+		copy(out[tail:], i.Payload)
+	}
+
+	return out
 }
 
-func (i *Income) Unmarshal(b []byte) error {
-	if len(b) < 8 {
+func (i *ServerMessage) Unmarshal(b []byte) error {
+	if len(b) < 1+RequestIDSize {
 		return ErrTooShort
 	}
-	i.Type = binary.BigEndian.Uint32(b[:4])
-	var tail uint32 = 4
-	rl := binary.BigEndian.Uint32(b[tail : tail+4])
-	tail += 4
-	if uint32(len(b)) < tail+rl {
+	t, err := ParseServerMessageType(b[0])
+	if err != nil {
+		return fmt.Errorf("ParseServerMessageType: %w", err)
+	}
+	i.Type = t
+	if t == Income && len(b) < 1+RequestIDSize+ClientIDSize {
 		return ErrTooShort
 	}
-	i.ReqLogID = b[tail : tail+rl]
-	tail += rl
-	if uint32(len(b)) < tail+4 {
-		return ErrTooShort
+
+	tail := 1
+	i.RequestID = [RequestIDSize]byte(b[tail : tail+RequestIDSize])
+	tail += RequestIDSize
+
+	if t == Income {
+		i.SenderID = [ClientIDSize]byte(b[tail : tail+ClientIDSize])
+		tail += ClientIDSize
+		i.Payload = b[tail:]
 	}
-	i.SenderID = [ClientIDSize]byte(b[tail : tail+ClientIDSize])
-	tail += ClientIDSize
-	i.Payload = b[tail:]
 
 	return nil
 }
 
-func (i Income) HexReqLogID() string {
-	return hex.EncodeToString(i.ReqLogID)
+func ParseServerMessageType(b byte) (ServerMessageType, error) {
+	switch b {
+	case 1:
+		return SendSuccess, nil
+	case 2:
+		return SendSuccess, nil
+	case 3:
+		return SendSuccess, nil
+	case 4:
+		return SendSuccess, nil
+	default:
+		return 0, errors.ErrUnsupported
+	}
 }
 
-func (i Income) Status() Status {
+func (i ServerMessage) Status() Status {
 	switch i.Type {
 	case SendSuccess:
 		return StatusSuccess
@@ -75,6 +92,6 @@ func (i Income) Status() Status {
 	}
 }
 
-func (i Income) IsSuccess() bool {
+func (i ServerMessage) IsSuccess() bool {
 	return i.Status() == StatusSuccess
 }

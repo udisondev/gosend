@@ -9,45 +9,47 @@ var (
 	ErrTooShort = errors.New("too short")
 )
 
-const (
-	SendSuccess uint32 = 0
-	SendError   uint32 = 1
-	NotFound    uint32 = 2
-	Private     uint32 = 3
+type ServerMessageType uint8
 
-	ChallangeSize = 32
-	ClientIDSize  = ed25519.PublicKeySize
+const (
+	SendSuccess ServerMessageType = iota + 1
+	SendError
+	NotFound
+	Income
 )
 
-func PrivateMessage(o Outcome, sender [ClientIDSize]byte) []byte {
-	income := Income{
-		Type:     Private,
-		ReqLogID: o.ReqLogID,
-		SenderID: sender,
-		Payload:  o.Payload,
-	}
-	b, _ := income.Mashal()
-	return b
+const (
+	ChallangeSize       = 32
+	ClientIDSize        = ed25519.PublicKeySize
+	RequestIDSize       = 16
+	MinPayloadSize      = 1
+	MinClientMessageLen = RequestIDSize + RequestIDSize + MinPayloadSize
+)
+
+func BuildIncome(o ClientMessage, sender [ClientIDSize]byte) []byte {
+	return ServerMessage{
+		Type:      Income,
+		RequestID: o.RequestID,
+		SenderID:  sender,
+		Payload:   o.Payload,
+	}.Mashal()
 }
 
-func EncodeSendSuccessResponse(o Outcome) []byte {
+func EncodeSendSuccessResponse(o ClientMessage) []byte {
 	return encodeResponse(o, SendSuccess)
 }
 
-func EncodeSendErrorResponse(o Outcome) []byte {
+func EncodeSendErrorResponse(o ClientMessage) []byte {
 	return encodeResponse(o, SendError)
 }
 
-func EncodeNotFoundResponse(o Outcome) []byte {
+func EncodeNotFoundResponse(o ClientMessage) []byte {
 	return encodeResponse(o, NotFound)
 }
 
-func encodeResponse(o Outcome, t uint32) []byte {
-	resp := Income{
-		Type:     t,
-		ReqLogID: o.ReqLogID,
-	}
-
-	b, _ := resp.Mashal()
-	return b
+func encodeResponse(o ClientMessage, t ServerMessageType) []byte {
+	return ServerMessage{
+		Type:      t,
+		RequestID: o.RequestID,
+	}.Mashal()
 }

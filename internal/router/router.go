@@ -8,38 +8,52 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"github.com/udisondev/gosend/pkg/pipe"
-	"github.com/udisondev/gosend/pkg/protocol"
 	"io"
 	"log/slog"
+	"math"
 	"net"
 	"sync"
-	"sync/atomic"
 	"time"
+
+	"github.com/udisondev/gosend/pkg/pipe"
+	"github.com/udisondev/gosend/pkg/protocol"
 
 	"golang.org/x/time/rate"
 )
 
 type router struct {
-	conns           map[[protocol.ClientIDSize]byte]*client
-	connsMu         sync.RWMutex
-	clietsCounter   atomic.Int32
-	messagesCounter atomic.Int32
-	maxsize         uint32
-	pool            sync.Pool
-	authPool        sync.Pool
-	clientPoolSize  int
+	conns    map[[protocol.ClientIDSize]byte]*conn
+	connsMu  sync.RWMutex
+	pool     sync.Pool
+	authPool sync.Pool
+	opts     routerOpts
 }
 
-type client struct {
-	id           [protocol.ClientIDSize]byte
-	pool         *sync.Pool
-	send         func([]byte) error
-	disconnect   func()
-	maxInputSize uint32
+type conn struct {
+	id         [protocol.ClientIDSize]byte
+	pool       *sync.Pool
+	send       func([]byte) error
+	disconnect func()
 }
 
-func Run(ctx context.Context, addr string, maxClients int, maxInputSize uint32) error {
+func Run(
+	ctx context.Context,
+	addr string,
+	opts ...RouterOpt,
+) error {
+	routerOpts := routerOpts{
+		maxInputSize:  DefaultMaxInputSize,
+		maxConnSize:   DefaultMaxConnSize,
+		outboxBufSize: DefaultOutboxBufSize,
+		rateLimit:     DefaultRateLimit,
+		burst:         DefaultBurst,
+	}
+	for _, apply := range opts {
+		if err := apply(&routerOpts); err != nil {
+			return fmt.Errorf("apply options: %w", err)
+		}
+	}
+
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
 		return fmt.Errorf("net.Listen: %w", err)
@@ -50,117 +64,98 @@ func Run(ctx context.Context, addr string, maxClients int, maxInputSize uint32) 
 	}()
 
 	r := router{
-		conns:   make(map[[protocol.ClientIDSize]byte]*client, maxClients),
-		maxsize: maxInputSize,
+		conns: make(map[[protocol.ClientIDSize]byte]*conn, routerOpts.maxConnSize),
 		authPool: sync.Pool{New: func() any {
 			return make([]byte, ed25519.PublicKeySize+protocol.ChallangeSize+ed25519.SignatureSize)
 		}},
 		pool: sync.Pool{New: func() any {
-			return make([]byte, maxInputSize)
+			return make([]byte, routerOpts.maxInputSize)
 		}},
-		clientPoolSize: 10,
+		opts: routerOpts,
 	}
-	var wg sync.WaitGroup
 
 	slog.Info("Ready to listen", "addr", addr)
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
-			break
+			return fmt.Errorf("listener.Accept: %w", err)
 		}
-		slog.Debug("Accepted new connection", "remote", conn.RemoteAddr())
 
-		wg.Go(func() { r.handleConn(ctx, conn) })
+		go r.handleConn(ctx, conn)
 	}
-
-	wg.Wait()
-	slog.Info("All connections closed")
-
-	return nil
 }
 
-func (r *router) handleConn(ctx context.Context, conn net.Conn) {
-	defer conn.Close()
+func (r *router) handleConn(ctx context.Context, netconn net.Conn) {
+	defer netconn.Close()
 
-	id, err := r.auth(2*time.Second, conn)
+	id, err := r.auth(2*time.Second, netconn)
 	if err != nil {
-		slog.Error("Failed to authenticate connection", "err", err, "remote", conn.RemoteAddr())
+		slog.Error("Failed to authenticate connection", "err", err, "remote", netconn.RemoteAddr())
 		return
 	}
-	slog.Debug("Authentication successful", "id", hex.EncodeToString(id[:]), "remote", conn.RemoteAddr())
 
 	clientCtx, disconnect := context.WithCancel(ctx)
-	outbox := make(chan []byte, r.clientPoolSize)
+	outbox := make(chan []byte, r.opts.outboxBufSize)
 	defer close(outbox)
 
 	go func() {
 		defer disconnect()
-		slog.Debug("Started sender goroutine", "id", hex.EncodeToString(id[:]))
 
 		for out := range outbox {
-			slog.Debug("Sending message length", "id", hex.EncodeToString(id[:]), "len", len(out))
-			if err = binary.Write(conn, binary.BigEndian, uint32(len(out))); err != nil {
+			if err = binary.Write(netconn, binary.BigEndian, uint32(len(out))); err != nil {
 				slog.Error("Failed to send message len", "err", err, "id", hex.EncodeToString(id[:]))
 				return
 			}
-
-			slog.Debug("Sending message", "id", hex.EncodeToString(id[:]), "len", len(out))
-			if _, err := conn.Write(out); err != nil {
+			if _, err := netconn.Write(out); err != nil {
 				slog.Error("Failed to send message", "err", err, "id", hex.EncodeToString(id[:]))
 				return
 			}
 		}
-		slog.Debug("Sender goroutine exiting", "id", hex.EncodeToString(id[:]))
 	}()
 
-	client := client{
+	conn := conn{
 		id: id,
 		send: func(out []byte) error {
 			select {
 			case outbox <- out:
-				slog.Debug("Queued message to send", "id", hex.EncodeToString(id[:]), "len", len(out))
 				return nil
 			default:
-				slog.Warn("Send queue full, busy", "id", hex.EncodeToString(id[:]))
 				return errors.New("busy")
 			}
 		},
-		maxInputSize: r.maxsize,
-		pool:         &r.pool,
-		disconnect:   disconnect,
+		pool:       &r.pool,
+		disconnect: disconnect,
 	}
 
-	inbox := pipe.LimitRate(client.Inbox(conn), rate.Limit(50), 100)
+	inbox := pipe.LimitRate(
+		conn.Inbox(netconn, r.opts.maxInputSize),
+		rate.Limit(r.opts.rateLimit),
+		r.opts.burst,
+	)
 
 	r.connsMu.Lock()
-	r.conns[id] = &client
+	r.conns[id] = &conn
 	r.connsMu.Unlock()
-	slog.Debug("Added client to connections", "id", hex.EncodeToString(id[:]), "total_clients", len(r.conns))
 
 	defer func() {
 		r.connsMu.Lock()
 		delete(r.conns, id)
 		r.connsMu.Unlock()
-		slog.Debug("Removed client from connections", "id", hex.EncodeToString(id[:]), "total_clients", len(r.conns))
 		disconnect()
-		slog.Debug("Client disconnected", "id", hex.EncodeToString(id[:]))
 	}()
 
 	for {
 		select {
 		case <-clientCtx.Done():
-			slog.Debug("Client context done", "id", hex.EncodeToString(id[:]))
 			return
 		case in, ok := <-inbox:
 			if !ok {
-				slog.Debug("Inbox channel closed", "id", hex.EncodeToString(id[:]))
 				return
 			}
-			slog.Debug("Processing incoming message", "id", hex.EncodeToString(id[:]), "len", len(in))
 			func() {
-				defer client.pool.Put(in)
+				defer conn.pool.Put(in)
 
-				if err := r.handleMessage(&client, in); err != nil {
+				if err := r.handleMessage(&conn, in); err != nil {
 					slog.Error("Failed to handle message", "err", err, "id", hex.EncodeToString(id[:]))
 					return
 				}
@@ -169,73 +164,44 @@ func (r *router) handleConn(ctx context.Context, conn net.Conn) {
 	}
 }
 
-func (r *router) handleMessage(c *client, b []byte) (err error) {
-	var out protocol.Outcome
-	if err := out.Unmarshal(b); err != nil {
+func (r *router) handleMessage(c *conn, b []byte) (err error) {
+	var msg protocol.ClientMessage
+	if err := msg.Unmarshal(b); err != nil {
 		return fmt.Errorf("unmarshal outcome: %w", err)
 	}
-	slog.Debug("Unmarshaled outcome", "sender_id", hex.EncodeToString(c.id[:]), "req_log_id", hex.EncodeToString(out.ReqLogID), "recip_id", hex.EncodeToString(out.RecipientID[:]), "payload_len", len(out.Payload))
 
 	var resp []byte
 	defer func() {
 		if resp == nil {
 			return
 		}
-		slog.Debug("Sending response", "sender_id", hex.EncodeToString(c.id[:]), "type", respType(resp), "len", len(resp))
-		err = c.send(resp)
-		if err != nil {
-			slog.Warn("Failed to send response", "err", err, "sender_id", hex.EncodeToString(c.id[:]))
-		}
+		_ = c.send(resp)
 	}()
 
 	r.connsMu.RLock()
 	defer r.connsMu.RUnlock()
 
-	recip, ok := r.conns[out.RecipID()]
+	recip, ok := r.conns[msg.RecipientID]
 	if !ok {
-		slog.Debug("Recipient not found", "recip_id", hex.EncodeToString(out.RecipientID[:]))
-		resp = protocol.EncodeNotFoundResponse(out)
+		resp = protocol.EncodeNotFoundResponse(msg)
 		return
 	}
 
-	pm := protocol.PrivateMessage(out, c.id)
-	slog.Debug("Forwarding private message", "recip_id", hex.EncodeToString(out.RecipientID[:]), "len", len(pm))
+	pm := protocol.BuildIncome(msg, c.id)
 	if err := recip.send(pm); err != nil {
-		slog.Warn("Failed to send private message to recipient", "err", err, "recip_id", hex.EncodeToString(out.RecipientID[:]))
-		resp = protocol.EncodeSendErrorResponse(out)
+		resp = protocol.EncodeSendErrorResponse(msg)
 		recip.disconnect()
 		return nil
 	}
 
-	resp = protocol.EncodeSendSuccessResponse(out)
+	resp = protocol.EncodeSendSuccessResponse(msg)
 
 	return
 }
 
-func respType(b []byte) string {
-	if len(b) < 4 {
-		return "unknown"
-	}
-	t := binary.BigEndian.Uint32(b[:4])
-	switch t {
-	case protocol.SendSuccess:
-		return "SendSuccess"
-	case protocol.SendError:
-		return "SendError"
-	case protocol.NotFound:
-		return "NotFound"
-	default:
-		return "unknown"
-	}
-}
-
-func (r *router) auth(timeout time.Duration, conn net.Conn) ([protocol.ClientIDSize]byte, error) {
-	handleErr := func(desc string, err error) ([protocol.ClientIDSize]byte, error) {
-		return [protocol.ClientIDSize]byte{}, fmt.Errorf("%s: %w", desc, err)
-	}
+func (r *router) auth(timeout time.Duration, conn net.Conn) (id [protocol.ClientIDSize]byte, err error) {
 	conn.SetDeadline(time.Now().Add(timeout))
 	defer conn.SetDeadline(time.Time{})
-	slog.Debug("Starting authentication", "remote", conn.RemoteAddr())
 
 	buf := r.authPool.Get().([]byte)
 	clear(buf)
@@ -247,66 +213,51 @@ func (r *router) auth(timeout time.Duration, conn net.Conn) ([protocol.ClientIDS
 	tail = tail[protocol.ChallangeSize:]
 	sign := tail[:ed25519.SignatureSize]
 	if _, err := io.ReadFull(conn, pubsign); err != nil {
-		slog.Error("Failed to read pubsign", "err", err, "remote", conn.RemoteAddr())
-		return handleErr("read pubsign timeout", err)
+		return id, fmt.Errorf("read pubsign timeout: %w", err)
 	}
-	slog.Debug("Read pubsign", "pubsign", hex.EncodeToString(pubsign))
 
 	rand.Read(challange)
 	if _, err := conn.Write(challange); err != nil {
-		slog.Error("Failed to send challenge", "err", err, "remote", conn.RemoteAddr())
-		return handleErr("send challange", err)
+		return id, fmt.Errorf("send challange: %w", err)
 	}
-	slog.Debug("Sent challenge", "challenge", hex.EncodeToString(challange))
 
 	if _, err := io.ReadFull(conn, sign); err != nil {
-		slog.Error("Failed to read sign", "err", err, "remote", conn.RemoteAddr())
-		return handleErr("read sign", err)
+		return id, fmt.Errorf("read sign: %w", err)
 	}
-	slog.Debug("Read sign", "sign", hex.EncodeToString(sign))
 
 	if !ed25519.Verify(pubsign, challange, sign) {
-		slog.Error("Verification failed", "remote", conn.RemoteAddr())
-		return [protocol.ClientIDSize]byte{}, errors.New("failed")
+		return id, errors.New("failed")
 	}
-	slog.Debug("Verification successful", "remote", conn.RemoteAddr())
 
-	var out [protocol.ClientIDSize]byte
-	copy(out[:], pubsign)
+	copy(id[:], pubsign)
 
-	return out, nil
+	return id, nil
 }
 
-func (c *client) Inbox(conn net.Conn) <-chan []byte {
+func (c *conn) Inbox(conn net.Conn, maxInputSize int) <-chan []byte {
 	out := make(chan []byte)
 	go func() {
 		defer close(out)
 		idStr := hex.EncodeToString(c.id[:])
-		slog.Debug("Started reader goroutine", "id", idStr)
 
 		var mlen uint32
 		for {
-			slog.Debug("Waiting to read message length", "id", idStr)
 			if err := binary.Read(conn, binary.BigEndian, &mlen); err != nil {
 				slog.Error("Failed to read message length", "err", err, "id", idStr)
 				return
 			}
-			if mlen > c.maxInputSize {
-				slog.Debug("Too big message", "id", idStr, "mlen", mlen, "max", c.maxInputSize)
+			if mlen > uint32(maxInputSize) {
 				return
 			}
-			slog.Debug("Read message length", "id", idStr, "mlen", mlen)
 
 			buf := c.pool.Get().([]byte)
 			buf = buf[:mlen]
 
-			slog.Debug("Reading message body", "id", idStr, "mlen", mlen)
 			if _, err := io.ReadFull(conn, buf); err != nil {
 				c.pool.Put(buf)
 				slog.Error("Failed to read message", "err", err, "id", idStr)
 				return
 			}
-			slog.Debug("Read message body", "id", idStr, "len", mlen)
 
 			out <- buf
 		}
