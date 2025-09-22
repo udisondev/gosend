@@ -3,11 +3,12 @@ package main
 import (
 	"context"
 	"flag"
-	"github.com/udisondev/gosend/router"
 	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
+
+	"github.com/udisondev/gosend/internal/router"
 )
 
 func main() {

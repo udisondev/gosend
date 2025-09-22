@@ -7,6 +7,8 @@ require (
 	golang.org/x/time v0.13.0
 )
 
+require golang.org/x/text v0.22.0 // indirect
+
 require (
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/pion/datachannel v1.5.10 // indirect
@@ -24,6 +26,7 @@ require (
 	github.com/pion/stun/v3 v3.0.0 // indirect
 	github.com/pion/transport/v3 v3.0.7 // indirect
 	github.com/pion/turn/v4 v4.1.1 // indirect
+	github.com/samber/lo v1.51.0
 	github.com/wlynxg/anet v0.0.5 // indirect
 	golang.org/x/crypto v0.33.0 // indirect
 	golang.org/x/net v0.35.0 // indirect

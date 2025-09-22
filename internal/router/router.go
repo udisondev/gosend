@@ -32,10 +32,11 @@ type router struct {
 }
 
 type client struct {
-	id         [protocol.ClientIDSize]byte
-	pool       *sync.Pool
-	send       func([]byte) error
-	disconnect func()
+	id           [protocol.ClientIDSize]byte
+	pool         *sync.Pool
+	send         func([]byte) error
+	disconnect   func()
+	maxInputSize uint32
 }
 
 func Run(ctx context.Context, addr string, maxClients int, maxInputSize uint32) error {
@@ -124,8 +125,9 @@ func (r *router) handleConn(ctx context.Context, conn net.Conn) {
 				return errors.New("busy")
 			}
 		},
-		pool:       &r.pool,
-		disconnect: disconnect,
+		maxInputSize: r.maxsize,
+		pool:         &r.pool,
+		disconnect:   disconnect,
 	}
 
 	inbox := pipe.LimitRate(client.Inbox(conn), rate.Limit(50), 100)
@@ -289,26 +291,24 @@ func (c *client) Inbox(conn net.Conn) <-chan []byte {
 				slog.Error("Failed to read message length", "err", err, "id", idStr)
 				return
 			}
+			if mlen > c.maxInputSize {
+				slog.Debug("Too big message", "id", idStr, "mlen", mlen, "max", c.maxInputSize)
+				return
+			}
 			slog.Debug("Read message length", "id", idStr, "mlen", mlen)
 
 			buf := c.pool.Get().([]byte)
-			clear(buf)
-
-			if mlen > uint32(len(buf)) {
-				c.pool.Put(buf)
-				slog.Error("Too big message length", "mlen", mlen, "max", len(buf), "id", idStr)
-				return
-			}
+			buf = buf[:mlen]
 
 			slog.Debug("Reading message body", "id", idStr, "mlen", mlen)
-			if _, err := io.ReadFull(conn, buf[:mlen]); err != nil {
+			if _, err := io.ReadFull(conn, buf); err != nil {
 				c.pool.Put(buf)
 				slog.Error("Failed to read message", "err", err, "id", idStr)
 				return
 			}
 			slog.Debug("Read message body", "id", idStr, "len", mlen)
 
-			out <- buf[:mlen]
+			out <- buf
 		}
 	}()
 

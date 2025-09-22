@@ -1,4 +1,4 @@
-package p2pclient
+package p2p
 
 import (
 	"context"
@@ -10,470 +10,337 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
-	"time"
 
 	"github.com/pion/webrtc/v4"
+	"github.com/samber/lo"
 	"github.com/udisondev/gosend/internal/client"
 	"github.com/udisondev/gosend/pkg/protocol"
 )
 
 type SignalMessage struct {
 	Type      string                     `json:"type"`
-	SDP       *webrtc.SessionDescription `json:"sdp,omitempty"`
-	Candidate *webrtc.ICECandidateInit   `json:"candidate,omitempty"`
+	SDP       *webrtc.SessionDescription `json:"sdp"`
+	Candidate *webrtc.ICECandidateInit   `json:"candidate"`
 }
 
-type Peer struct {
-	HexID  string
-	inCh   <-chan string
-	sendCh chan string
-	close  func()
-}
+const (
+	TypeOffer     string = "offer"
+	TypeAnswer    string = "answer"
+	TypeCandidate string = "candidate"
+)
 
 func (p *Peer) Send(msg string) error {
-	select {
-	case p.sendCh <- msg:
-		return nil
-	default:
-		return errors.New("send buffer full")
-	}
+	return p.dc.Send([]byte(msg))
 }
 
-func (p *Peer) Inbox() <-chan string {
-	return p.inCh
+type Client struct {
+	rc       *client.Client
+	myID     [protocol.ClientIDSize]byte
+	myHexID  string
+	mu       sync.Mutex
+	peers    map[string]*Peer
+	newPeers chan *Peer
 }
 
-func (p *Peer) Close() {
-	p.close()
-}
-
-type peerState struct {
-	pc        *webrtc.PeerConnection
-	dc        *webrtc.DataChannel
-	inCh      chan string
-	sendCh    chan string
-	connected chan struct{}
-	close     func()
-}
-
-type P2PClient struct {
-	baseClient *client.Client
-	myID       [protocol.ClientIDSize]byte
-	myHexID    string
-	ctx        context.Context
-	cancel     context.CancelFunc
-	mu         sync.Mutex
-	peers      map[string]*peerState
-	newPeers   chan *Peer
-	logger     *slog.Logger
-}
-
-func NewP2PClient(parentCtx context.Context, addr string) (*P2PClient, <-chan *Peer, error) {
-	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+func NewP2PClient(
+	connectCtx context.Context,
+	addr string,
+	pubsign ed25519.PublicKey,
+	privsign ed25519.PrivateKey,
+) (*Client, error) {
+	myID := [protocol.ClientIDSize]byte(pubsign)
+	baseClient, err := client.Connect(connectCtx, addr, pubsign, privsign)
 	if err != nil {
-		return nil, nil, fmt.Errorf("generate keys: %w", err)
-	}
-	myID := [protocol.ClientIDSize]byte(pub)
-	myHexID := hex.EncodeToString(pub)
-	slog.Debug("Generated public key", "hex", myHexID)
-	fmt.Printf("My ID: %s\n", myHexID)
-
-	ctx, cancel := context.WithCancel(parentCtx)
-	baseClient, err := client.Connect(ctx, addr, pub, priv)
-	if err != nil {
-		cancel()
-		return nil, nil, fmt.Errorf("connect to router: %w", err)
+		return nil, fmt.Errorf("client.Connect: %w", err)
 	}
 	slog.Debug("Connected to router")
 
-	p := &P2PClient{
-		baseClient: baseClient,
-		myID:       myID,
-		myHexID:    myHexID,
-		ctx:        ctx,
-		cancel:     cancel,
-		peers:      make(map[string]*peerState),
-		newPeers:   make(chan *Peer, 10),
-		logger:     slog.Default(),
+	p := &Client{
+		rc:       baseClient,
+		myID:     myID,
+		peers:    make(map[string]*Peer),
+		newPeers: make(chan *Peer, 10),
 	}
 
-	go p.listenForSignals(baseClient.Listen(10))
-
-	return p, p.newPeers, nil
+	return p, nil
 }
 
-func (p *P2PClient) Close() {
-	p.cancel()
-}
-
-func (p *P2PClient) ConnectWith(connectCtx context.Context, hexID string) error {
-	remoteID, err := hexToID(hexID)
-	if err != nil {
-		return err
-	}
-
-	p.mu.Lock()
-	if ps, ok := p.peers[hexID]; ok {
-		p.mu.Unlock()
-		select {
-		case <-ps.connected:
-			return nil
-		case <-connectCtx.Done():
-			return connectCtx.Err()
-		}
-	}
-	p.mu.Unlock()
-
-	err = p.initiateConnection(remoteID, hexID)
-	if err != nil {
-		return err
-	}
-
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-connectCtx.Done():
-			return connectCtx.Err()
-		case <-ticker.C:
-			p.mu.Lock()
-			ps, ok := p.peers[hexID]
-			p.mu.Unlock()
-			if ok {
-				select {
-				case <-ps.connected:
-					return nil
-				default:
-				}
-			}
-		}
-	}
-}
-
-func (p *P2PClient) initiateConnection(remoteID [protocol.ClientIDSize]byte, hexID string) error {
-	config := webrtcConfig()
-	pc, err := webrtc.NewPeerConnection(config)
-	if err != nil {
-		return fmt.Errorf("create peer connection: %w", err)
-	}
-	slog.Debug("Created PeerConnection as initiator", "remote", hexID)
-
-	dc, err := pc.CreateDataChannel("chat", nil)
-	if err != nil {
-		pc.Close()
-		return fmt.Errorf("create data channel: %w", err)
-	}
-
-	inCh := make(chan string, 10)
-	sendCh := make(chan string, 10)
-	connected := make(chan struct{})
-
-	ps := &peerState{
-		pc:        pc,
-		dc:        dc,
-		inCh:      inCh,
-		sendCh:    sendCh,
-		connected: connected,
-		close: func() {
-			pc.Close()
-			close(inCh)
-			close(connected)
-		},
-	}
-
-	p.mu.Lock()
-	p.peers[hexID] = ps
-	p.mu.Unlock()
-
-	go setupDataChannel(dc, inCh, sendCh)
-	go setupICECandidates(pc, p.baseClient, remoteID)
-	go p.handleConnectionStateChanges(ps, hexID, connected)
-
-	offer, err := pc.CreateOffer(nil)
-	if err != nil {
-		ps.close()
-		return fmt.Errorf("create offer: %w", err)
-	}
-	if err := pc.SetLocalDescription(offer); err != nil {
-		ps.close()
-		return fmt.Errorf("set local description: %w", err)
-	}
-	slog.Debug("Created and set local description (offer)", "remote", hexID)
-
-	offerMsg := SignalMessage{Type: "offer", SDP: &offer}
-	payload, err := json.Marshal(offerMsg)
-	if err != nil {
-		ps.close()
-		return fmt.Errorf("marshal offer: %w", err)
-	}
-
-	reqLogID, err := generateReqLogID()
-	if err != nil {
-		ps.close()
-		return fmt.Errorf("generate reqLogID: %w", err)
-	}
-
-	o := protocol.Outcome{
-		ReqLogID:    reqLogID,
-		RecipientID: remoteID,
-		Payload:     payload,
-	}
-	respCh, err := p.baseClient.Send(o)
-	if err != nil {
-		ps.close()
-		return fmt.Errorf("send offer: %w", err)
-	}
-	slog.Debug("Sent offer", "reqLogID", hex.EncodeToString(reqLogID), "recipient", hexID)
-
-	go waitForSendResponse(respCh)
-
-	return nil
-}
-
-func (p *P2PClient) listenForSignals(inbox <-chan protocol.Income) {
-	for {
-		select {
-		case <-p.ctx.Done():
-			return
-		case in, ok := <-inbox:
-			if !ok {
-				return
-			}
+func (c *Client) Listen() <-chan *Peer {
+	go func() {
+		for in := range c.rc.Listen(100) {
 			hexSender := hex.EncodeToString(in.SenderID[:])
 			slog.Debug("Received incoming message", "type", in.Type, "sender", hexSender, "reqLogID", in.HexReqLogID(), "payload_len", len(in.Payload))
 
 			var msg SignalMessage
 			if err := json.Unmarshal(in.Payload, &msg); err != nil {
-				slog.Error("Failed to unmarshal signal message", "err", err)
+				slog.Error("Failed to unmarshal signal message", "err", err, "payload", string(in.Payload))
 				continue
 			}
 			slog.Debug("Parsed signal message", "type", msg.Type, "sender", hexSender)
 
-			p.mu.Lock()
-			ps, ok := p.peers[hexSender]
-			if !ok && msg.Type == "offer" {
-				ps, err := p.handleNewOffer(in.SenderID, hexSender, msg)
-				if err != nil {
-					slog.Error("Failed to handle new offer", "err", err, "sender", hexSender)
-					p.mu.Unlock()
+			switch msg.Type {
+			case TypeOffer:
+				c.handleNewOffer(in.SenderID, msg)
+			case TypeAnswer:
+				slog.Debug("Received answer")
+				c.mu.Lock()
+				peer, ok := c.peers[hexSender]
+				c.mu.Unlock()
+				if !ok {
+					slog.Debug("Unknown answer")
 					continue
 				}
-				p.peers[hexSender] = ps
-			}
-			if !ok {
-				slog.Warn("No peer for message", "sender", hexSender, "type", msg.Type)
-				p.mu.Unlock()
+
+				if err := peer.pc.SetRemoteDescription(*msg.SDP); err != nil {
+					slog.Error("Failed to set remote description (answer)", "err", err)
+				} else {
+					slog.Debug("Set remote description (answer)")
+				}
+			case TypeCandidate:
+				c.mu.Lock()
+				peer, ok := c.peers[hexSender]
+				c.mu.Unlock()
+				if !ok {
+					slog.Debug("Unknown candidate", "sender", hexSender)
+					continue
+				}
+
+				if err := peer.pc.AddICECandidate(*msg.Candidate); err != nil {
+					slog.Error("Failed to add condidate", "sender", hexSender)
+					continue
+				}
+			default:
+				slog.Debug("Unknown message type", "type", msg.Type)
 				continue
 			}
-			pc := ps.pc
-			p.mu.Unlock()
-
-			switch msg.Type {
-			case "offer":
-				// Уже обработано выше
-			case "answer":
-				if err := pc.SetRemoteDescription(*msg.SDP); err != nil {
-					slog.Error("Failed to set remote description (answer)", "err", err, "sender", hexSender)
-				} else {
-					slog.Debug("Set remote description (answer)", "sender", hexSender)
-				}
-			case "candidate":
-				if msg.Candidate != nil {
-					if err := pc.AddICECandidate(*msg.Candidate); err != nil {
-						slog.Error("Failed to add ICE candidate", "err", err, "sender", hexSender)
-					} else {
-						slog.Debug("Added ICE candidate", "candidate", msg.Candidate.Candidate, "sender", hexSender)
-					}
-				}
-			}
 		}
-	}
+	}()
+
+	return c.newPeers
 }
 
-func (p *P2PClient) handleNewOffer(senderID [protocol.ClientIDSize]byte, hexSender string, msg SignalMessage) (*peerState, error) {
+func (c *Client) ConnectWith(hexID string) error {
+	remoteID, err := hexToID(hexID)
+	if err != nil {
+		return err
+	}
+
+	return c.initiateConnection(remoteID, hexID)
+}
+
+func (c *Client) initiateConnection(peerID [protocol.ClientIDSize]byte, hexID string) (err error) {
 	config := webrtcConfig()
 	pc, err := webrtc.NewPeerConnection(config)
 	if err != nil {
-		return nil, fmt.Errorf("create peer connection: %w", err)
+		return fmt.Errorf("create peer connection: %w", err)
 	}
-	slog.Debug("Created PeerConnection as responder", "sender", hexSender)
+	defer func() {
+		if err == nil {
+			return
+		}
+		pc.Close()
+	}()
 
-	dcCh := make(chan *webrtc.DataChannel, 1)
-	pc.OnDataChannel(func(dc *webrtc.DataChannel) {
-		if dc.Label() == "chat" {
-			dcCh <- dc
+	dc, err := pc.CreateDataChannel("chat", nil)
+	if err != nil {
+		return fmt.Errorf("create data channel: %w", err)
+	}
+	defer func() {
+		if err == nil {
+			return
+		}
+		dc.Close()
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	peer := Peer{
+		id:         peerID,
+		inCh:       make(chan Message, 100),
+		dc:         dc,
+		pc:         pc,
+		disconnect: cancel,
+		ctx:        ctx,
+	}
+
+	c.setupPC(pc, &peer)
+
+	slog.Debug("Created PeerConnection as initiator", "remote", hexID)
+
+	dc.OnOpen(func() {
+		slog.Debug("Data channel opened")
+		peer.inCh <- Message{
+			Text: "Hello",
 		}
 	})
+	dc.OnMessage(func(income webrtc.DataChannelMessage) {
+		slog.Debug("Received message via data channel", "peer", hexID)
+
+		var msg Message
+		if err := json.Unmarshal(income.Data, &msg); err != nil {
+			slog.Error("Failed to unmarshal msg", "data", income.Data)
+			return
+		}
+	})
+	dc.OnClose(func() {
+		slog.Debug("Data channel closed")
+	})
+
+	c.mu.Lock()
+	c.peers[hexID] = &peer
+	c.mu.Unlock()
+
+	offer, err := pc.CreateOffer(nil)
+	if err != nil {
+		return fmt.Errorf("create offer: %w", err)
+	}
+	if err := pc.SetLocalDescription(offer); err != nil {
+		return fmt.Errorf("set local description: %w", err)
+	}
+	slog.Debug("Created and set local description (offer)", "remote", hexID)
+
+	offerMsg := SignalMessage{Type: TypeOffer, SDP: &offer}
+	payload, err := json.Marshal(offerMsg)
+	if err != nil {
+		return fmt.Errorf("marshal offer: %w", err)
+	}
+
+	reqLogID := generateReqLogID()
+	o := protocol.Outcome{
+		ReqLogID:    reqLogID,
+		RecipientID: peerID,
+		Payload:     payload,
+	}
+	respCh, err := c.rc.Send(o)
+	if err != nil {
+		return fmt.Errorf("send offer: %w", err)
+	}
+
+	if resp := <-respCh; !resp.IsSuccess() {
+		return fmt.Errorf("send offer: %w", err)
+	}
+
+	slog.Debug("Sent offer", "reqLogID", hex.EncodeToString(reqLogID), "recipient", hexID)
+
+	return nil
+}
+
+func (c *Client) handleNewOffer(senderID [protocol.ClientIDSize]byte, msg SignalMessage) (err error) {
+	hexID := hex.EncodeToString(senderID[:])
+
+	config := webrtcConfig()
+
+	pc, err := webrtc.NewPeerConnection(config)
+	if err != nil {
+		return fmt.Errorf("create peer connection: %w", err)
+	}
+	defer func() {
+		if err == nil {
+			return
+		}
+		pc.Close()
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	peer := Peer{
+		id:         senderID,
+		inCh:       make(chan Message),
+		pc:         pc,
+		ctx:        ctx,
+		disconnect: cancel,
+	}
+	c.mu.Lock()
+	c.peers[hexID] = &peer
+	c.mu.Unlock()
+	go func() {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		delete(c.peers, hexID)
+	}()
+
+	go func() {
+		<-ctx.Done()
+		pc.Close()
+	}()
+
+	pc.OnDataChannel(func(dc *webrtc.DataChannel) {
+		peer.dc = dc
+		go func() {
+			<-ctx.Done()
+			dc.Close()
+		}()
+
+		dc.OnMessage(func(income webrtc.DataChannelMessage) {
+			slog.Debug("Received message via data channel", "peer", hexID)
+
+			var msg Message
+			if err := json.Unmarshal(income.Data, &msg); err != nil {
+				slog.Error("Failed to unmarshal msg", "data", income.Data)
+				return
+			}
+
+			peer.inCh <- msg
+		})
+
+		dc.OnClose(func() {
+			slog.Debug("Data channel closed")
+		})
+	})
+
+	c.setupPC(pc, &peer)
 
 	if err := pc.SetRemoteDescription(*msg.SDP); err != nil {
-		pc.Close()
-		return nil, fmt.Errorf("set remote description: %w", err)
+		return fmt.Errorf("set remote description: %w", err)
 	}
-	slog.Debug("Set remote description (offer)", "sender", hexSender)
+	slog.Debug("Set remote description (offer)", "sender", hexID)
 
 	answer, err := pc.CreateAnswer(nil)
 	if err != nil {
-		pc.Close()
-		return nil, fmt.Errorf("create answer: %w", err)
+		return fmt.Errorf("create answer: %w", err)
 	}
 	if err := pc.SetLocalDescription(answer); err != nil {
-		pc.Close()
-		return nil, fmt.Errorf("set local description: %w", err)
+		return fmt.Errorf("set local description: %w", err)
 	}
-	slog.Debug("Created and set local description (answer)", "sender", hexSender)
+	slog.Debug("Created and set local description (answer)", "sender", hexID)
 
-	answerMsg := SignalMessage{Type: "answer", SDP: &answer}
+	answerMsg := SignalMessage{Type: TypeAnswer, SDP: &answer}
 	payload, err := json.Marshal(answerMsg)
 	if err != nil {
-		pc.Close()
-		return nil, fmt.Errorf("marshal answer: %w", err)
+		return fmt.Errorf("marshal answer: %w", err)
 	}
 
-	reqLogID, err := generateReqLogID()
-	if err != nil {
-		pc.Close()
-		return nil, fmt.Errorf("generate reqLogID: %w", err)
-	}
-
+	reqLogID := generateReqLogID()
 	o := protocol.Outcome{
 		ReqLogID:    reqLogID,
 		RecipientID: senderID,
 		Payload:     payload,
 	}
-	respCh, err := p.baseClient.Send(o)
+	respCh, err := c.rc.Send(o)
 	if err != nil {
-		pc.Close()
-		return nil, fmt.Errorf("send answer: %w", err)
+		return fmt.Errorf("send answer: %w", err)
 	}
-	slog.Debug("Sent answer", "reqLogID", hex.EncodeToString(reqLogID), "recipient", hexSender)
+	slog.Debug("Sent answer", "reqLogID", hex.EncodeToString(reqLogID), "recipient", hexID)
 
-	go waitForSendResponse(respCh)
-
-	inCh := make(chan string, 10)
-	sendCh := make(chan string, 10)
-	connected := make(chan struct{})
-
-	ps := &peerState{
-		pc:        pc,
-		inCh:      inCh,
-		sendCh:    sendCh,
-		connected: connected,
-		close: func() {
-			pc.Close()
-			close(inCh)
-			close(connected)
-		},
+	if reply := <-respCh; !reply.IsSuccess() {
+		err = fmt.Errorf("send answer: response status=%s", reply.Status())
+		return
 	}
 
-	go func() {
-		select {
-		case dc := <-dcCh:
-			setupDataChannel(dc, inCh, sendCh)
-			ps.dc = dc
-		case <-p.ctx.Done():
-		}
-	}()
-
-	go setupICECandidates(pc, p.baseClient, senderID)
-	go p.handleConnectionStateChanges(ps, hexSender, connected)
-
-	return ps, nil
+	return nil
 }
 
-func (p *P2PClient) handleConnectionStateChanges(ps *peerState, hexID string, connected chan struct{}) {
-	ps.pc.OnConnectionStateChange(func(s webrtc.PeerConnectionState) {
-		slog.Debug("PeerConnection state changed", "state", s, "peer", hexID)
-		if s == webrtc.PeerConnectionStateConnected {
-			close(connected)
-			peer := &Peer{
-				HexID:  hexID,
-				inCh:   ps.inCh,
-				sendCh: ps.sendCh,
-				close:  ps.close,
-			}
-			select {
-			case p.newPeers <- peer:
-				slog.Debug("Sent new peer to channel", "peer", hexID)
-			default:
-				slog.Warn("New peers channel full, dropping peer", "peer", hexID)
-			}
-		}
-		if s == webrtc.PeerConnectionStateFailed || s == webrtc.PeerConnectionStateDisconnected || s == webrtc.PeerConnectionStateClosed {
-			ps.close()
-			p.mu.Lock()
-			delete(p.peers, hexID)
-			p.mu.Unlock()
-		}
-	})
-}
-
-func webrtcConfig() webrtc.Configuration {
-	return webrtc.Configuration{
-		ICEServers: []webrtc.ICEServer{
-			{URLs: []string{"stun:stun.l.google.com:19302"}},
-		},
-	}
-}
-
-func hexToID(hexID string) ([protocol.ClientIDSize]byte, error) {
-	b, err := hex.DecodeString(hexID)
-	if err != nil {
-		return [protocol.ClientIDSize]byte{}, err
-	}
-	if len(b) != protocol.ClientIDSize {
-		return [protocol.ClientIDSize]byte{}, errors.New("invalid ID length")
-	}
-	var id [protocol.ClientIDSize]byte
-	copy(id[:], b)
-	return id, nil
-}
-
-func generateReqLogID() ([]byte, error) {
-	reqLogID := make([]byte, 12)
-	_, err := rand.Read(reqLogID)
-	return reqLogID, err
-}
-
-// setupDataChannel и setupICECandidates как в предыдущих версиях, но адаптированные для chan string
-func setupDataChannel(dc *webrtc.DataChannel, inCh chan string, sendCh chan string) {
-	dc.OnOpen(func() {
-		slog.Debug("Data channel opened")
-		go func() {
-			for msg := range sendCh {
-				dc.SendText(msg)
-				slog.Debug("Sent message via data channel", "msg", msg)
-			}
-		}()
-	})
-	dc.OnMessage(func(msg webrtc.DataChannelMessage) {
-		if msg.IsString {
-			str := string(msg.Data)
-			slog.Debug("Received message via data channel", "msg", str)
-			inCh <- str
-		}
-	})
-	dc.OnClose(func() {
-		slog.Debug("Data channel closed")
-		close(inCh)
-	})
-}
-
-func setupICECandidates(pc *webrtc.PeerConnection, c *client.Client, remoteID [protocol.ClientIDSize]byte) {
+func (c *Client) setupPC(pc *webrtc.PeerConnection, peer *Peer) {
+	hexID := peer.HexID()
 	pc.OnICECandidate(func(candidate *webrtc.ICECandidate) {
 		if candidate == nil {
 			slog.Debug("ICE gathering complete")
 			return
 		}
+		candidate.ToJSON()
 		slog.Debug("Got ICE candidate", "candidate", candidate.ToJSON().Candidate)
 
 		candMsg := SignalMessage{
-			Type: "candidate",
-			Candidate: &webrtc.ICECandidateInit{
-				Candidate:        candidate.ToJSON().Candidate,
-				SDPMid:           candidate.ToJSON().SDPMid,
-				SDPMLineIndex:    candidate.ToJSON().SDPMLineIndex,
-				UsernameFragment: candidate.ToJSON().UsernameFragment,
-			},
+			Type:      TypeCandidate,
+			Candidate: lo.ToPtr(candidate.ToJSON()),
 		}
 		payload, err := json.Marshal(candMsg)
 		if err != nil {
@@ -481,36 +348,67 @@ func setupICECandidates(pc *webrtc.PeerConnection, c *client.Client, remoteID [p
 			return
 		}
 
-		reqLogID := make([]byte, 12)
-		if _, err := rand.Read(reqLogID); err != nil {
-			slog.Error("Failed to generate reqLogID", "err", err)
-			return
-		}
-
+		reqLogID := generateReqLogID()
 		o := protocol.Outcome{
 			ReqLogID:    reqLogID,
-			RecipientID: remoteID,
+			RecipientID: peer.id,
 			Payload:     payload,
 		}
-		respCh, err := c.Send(o)
+		respCh, err := c.rc.Send(o)
 		if err != nil {
 			slog.Error("Failed to send candidate", "err", err)
 			return
 		}
-		slog.Debug("Sent candidate", "reqLogID", hex.EncodeToString(reqLogID), "recipient", hex.EncodeToString(remoteID[:]))
+		slog.Debug("Sent candidate", "reqLogID", hex.EncodeToString(reqLogID), "recipient", hexID)
 
-		go waitForSendResponse(respCh)
+		if reply := <-respCh; !reply.IsSuccess() {
+			slog.Error("Failed to send ICE candidate", "recipient", hexID)
+		}
+	})
+
+	pc.OnConnectionStateChange(func(s webrtc.PeerConnectionState) {
+		slog.Debug("PeerConnection state changed", "state", s, "peer", hexID)
+		if s == webrtc.PeerConnectionStateConnected {
+			select {
+			case c.newPeers <- peer:
+				c.mu.Lock()
+				c.peers[hexID] = peer
+				c.mu.Unlock()
+
+				slog.Debug("Sent new peer to channel", "peer", hexID)
+			default:
+				slog.Warn("New peers channel full, dropping peer", "peer", hexID)
+			}
+		}
+		if s == webrtc.PeerConnectionStateFailed || s == webrtc.PeerConnectionStateDisconnected || s == webrtc.PeerConnectionStateClosed {
+			peer.disconnect()
+		}
 	})
 }
 
-func waitForSendResponse(ch <-chan protocol.Income) {
-	in, ok := <-ch
-	if !ok {
-		slog.Debug("Response channel closed")
-		return
+func hexToID(hexID string) ([protocol.ClientIDSize]byte, error) {
+	b, err := hex.DecodeString(hexID)
+	if err != nil {
+		return [protocol.ClientIDSize]byte{}, err
 	}
-	slog.Debug("Received send response", "status", in.Status(), "reqLogID", in.HexReqLogID())
-	if in.Status() != protocol.StatusSuccess {
-		slog.Error("Send failed", "status", in.Status())
+
+	if len(b) != protocol.ClientIDSize {
+		return [protocol.ClientIDSize]byte{}, errors.New("invalid ID length")
+	}
+
+	return [protocol.ClientIDSize]byte(b), nil
+}
+
+func generateReqLogID() []byte {
+	reqLogID := make([]byte, 12)
+	rand.Read(reqLogID)
+	return reqLogID
+}
+
+func webrtcConfig() webrtc.Configuration {
+	return webrtc.Configuration{
+		ICEServers: []webrtc.ICEServer{
+			{URLs: []string{"stun:stun.l.google.com:19302"}},
+		},
 	}
 }

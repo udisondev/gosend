@@ -74,3 +74,7 @@ func (i Income) Status() Status {
 		return StatusUnknown
 	}
 }
+
+func (i Income) IsSuccess() bool {
+	return i.Status() == StatusSuccess
+}
