@@ -23,7 +23,8 @@ const (
 	ClientIDSize        = ed25519.PublicKeySize
 	RequestIDSize       = 16
 	MinPayloadSize      = 1
-	MinClientMessageLen = RequestIDSize + RequestIDSize + MinPayloadSize
+	HeaderLen           = 4 + RequestIDSize + ClientIDSize
+	MinClientMessageLen = RequestIDSize + ClientIDSize + MinPayloadSize
 )
 
 func BuildIncome(o ClientMessage, sender [ClientIDSize]byte) []byte {
@@ -35,21 +36,21 @@ func BuildIncome(o ClientMessage, sender [ClientIDSize]byte) []byte {
 	}.Mashal()
 }
 
-func EncodeSendSuccessResponse(o ClientMessage) []byte {
-	return encodeResponse(o, SendSuccess)
+func EncodeSendSuccessResponse(reqID [RequestIDSize]byte) []byte {
+	return encodeResponse(reqID, SendSuccess)
 }
 
-func EncodeSendErrorResponse(o ClientMessage) []byte {
-	return encodeResponse(o, SendError)
+func EncodeSendErrorResponse(reqID [RequestIDSize]byte) []byte {
+	return encodeResponse(reqID, SendError)
 }
 
-func EncodeNotFoundResponse(o ClientMessage) []byte {
-	return encodeResponse(o, NotFound)
+func EncodeNotFoundResponse(reqID [RequestIDSize]byte) []byte {
+	return encodeResponse(reqID, NotFound)
 }
 
-func encodeResponse(o ClientMessage, t ServerMessageType) []byte {
+func encodeResponse(reqID [RequestIDSize]byte, t ServerMessageType) []byte {
 	return ServerMessage{
 		Type:      t,
-		RequestID: o.RequestID,
+		RequestID: reqID,
 	}.Mashal()
 }

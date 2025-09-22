@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -90,10 +89,13 @@ func listenRouter(
 
 		for {
 			in, err := read(conn, readTimeout)
-			if errors.Is(err, ErrUnmarshal) {
-				slog.Error("Failed to unmarshal server message", "err", err)
-				continue
+			if errors.Is(err, io.EOF) {
+				return
 			}
+			if errors.Is(err, io.ErrUnexpectedEOF) {
+				return
+			}
+
 			out <- in
 		}
 	}()
@@ -123,33 +125,29 @@ func read(conn net.Conn, timeout time.Duration) (protocol.ServerMessage, error) 
 	return in, nil
 }
 
-func (c *Client) Send(o protocol.ClientMessage) (ch <-chan protocol.ServerMessage, err error) {
+func (c *Client) Send(o protocol.ClientMessage) (<-chan protocol.ServerMessage, error) {
+	var ch chan protocol.ServerMessage
 	c.sendMu.Lock()
 	defer c.sendMu.Unlock()
 
 	output := o.Mashal()
-	if err = binary.Write(c.conn, binary.BigEndian, uint32(len(output))); err != nil {
+	if err := binary.Write(c.conn, binary.BigEndian, uint32(len(output))); err != nil {
 		return ch, fmt.Errorf("send message len: %w", err)
 	}
 
-	if _, err = c.conn.Write(output); err != nil {
+	if _, err := c.conn.Write(output); err != nil {
 		return ch, fmt.Errorf("send message: %w", err)
 	}
 
+	ch = make(chan protocol.ServerMessage)
 	c.reqsMu.Lock()
-	defer c.reqsMu.Unlock()
+	c.reqs[o.RequestID] = ch
+	c.reqsMu.Unlock()
 
-	resp := make(chan protocol.ServerMessage)
-	c.reqs[o.RequestID] = resp
-
-	return resp, nil
+	return ch, nil
 }
 
-func (c *Client) ID() [protocol.ClientIDSize]byte {
-	return c.id
-}
-
-func (c *Client) Cose() {
+func (c *Client) Close() {
 	c.conn.Close()
 }
 

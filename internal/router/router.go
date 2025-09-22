@@ -10,30 +10,31 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"math"
 	"net"
 	"sync"
 	"time"
 
-	"github.com/udisondev/gosend/pkg/pipe"
 	"github.com/udisondev/gosend/pkg/protocol"
-
-	"golang.org/x/time/rate"
 )
 
 type router struct {
-	conns    map[[protocol.ClientIDSize]byte]*conn
-	connsMu  sync.RWMutex
-	pool     sync.Pool
-	authPool sync.Pool
-	opts     routerOpts
+	conns      map[[protocol.ClientIDSize]byte]*conn
+	connsMu    sync.RWMutex
+	pool       sync.Pool
+	headerPool sync.Pool
+	authPool   sync.Pool
+	opts       routerOpts
 }
 
 type conn struct {
-	id         [protocol.ClientIDSize]byte
-	pool       *sync.Pool
-	send       func([]byte) error
-	disconnect func()
+	sendMu       sync.Mutex
+	writeTimeout time.Duration
+	readTimeout  time.Duration
+	conn         net.Conn
+	id           [protocol.ClientIDSize]byte
+	pool         *sync.Pool
+	send         func([]byte) error
+	disconnect   func()
 }
 
 func Run(
@@ -123,15 +124,10 @@ func (r *router) handleConn(ctx context.Context, netconn net.Conn) {
 				return errors.New("busy")
 			}
 		},
+		conn:       netconn,
 		pool:       &r.pool,
 		disconnect: disconnect,
 	}
-
-	inbox := pipe.LimitRate(
-		conn.Inbox(netconn, r.opts.maxInputSize),
-		rate.Limit(r.opts.rateLimit),
-		r.opts.burst,
-	)
 
 	r.connsMu.Lock()
 	r.conns[id] = &conn
@@ -145,58 +141,57 @@ func (r *router) handleConn(ctx context.Context, netconn net.Conn) {
 	}()
 
 	for {
-		select {
-		case <-clientCtx.Done():
-			return
-		case in, ok := <-inbox:
-			if !ok {
-				return
-			}
-			func() {
-				defer conn.pool.Put(in)
 
-				if err := r.handleMessage(&conn, in); err != nil {
-					slog.Error("Failed to handle message", "err", err, "id", hex.EncodeToString(id[:]))
-					return
-				}
-			}()
-		}
 	}
 }
 
-func (r *router) handleMessage(c *conn, b []byte) (err error) {
-	var msg protocol.ClientMessage
-	if err := msg.Unmarshal(b); err != nil {
-		return fmt.Errorf("unmarshal outcome: %w", err)
+func (r *router) handleMessage(sender *conn) error {
+	header := r.headerPool.Get().([]byte)
+	defer r.headerPool.Put(header)
+
+	if _, err := io.ReadFull(sender.conn, header); err != nil {
+		return fmt.Errorf("read header: %w", err)
 	}
 
-	var resp []byte
-	defer func() {
-		if resp == nil {
-			return
-		}
-		_ = c.send(resp)
-	}()
+	inLen := binary.BigEndian.Uint32(header[:4])
+	if inLen > uint32(r.opts.maxInputSize) {
+		return errors.New("too big")
+	}
 
-	r.connsMu.RLock()
-	defer r.connsMu.RUnlock()
+	offset := 4
+	reqID := [protocol.RequestIDSize]byte(header[offset : offset+protocol.RequestIDSize])
+	offset += 4
+	recipID := [protocol.ClientIDSize]byte(header[offset:])
 
-	recip, ok := r.conns[msg.RecipientID]
+	r.connsMu.Lock()
+	recip, ok := r.conns[recipID]
+	r.connsMu.Unlock()
 	if !ok {
-		resp = protocol.EncodeNotFoundResponse(msg)
-		return
-	}
-
-	pm := protocol.BuildIncome(msg, c.id)
-	if err := recip.send(pm); err != nil {
-		resp = protocol.EncodeSendErrorResponse(msg)
-		recip.disconnect()
+		if _, err := sender.Write(protocol.EncodeNotFoundResponse(reqID)); err != nil {
+			return fmt.Errorf("send response: %w", err)
+		}
 		return nil
 	}
 
-	resp = protocol.EncodeSendSuccessResponse(msg)
+	copy(header[offset:], sender.id[:])
 
-	return
+	if _, err := recip.Write(header); err != nil {
+		recip.disconnect()
+		if _, err := sender.Write(protocol.EncodeSendErrorResponse(reqID)); err != nil {
+			return fmt.Errorf("send response: %w", err)
+		}
+		return nil
+	}
+
+	if _, err := io.CopyN(recip, sender.conn, int64(inLen)-protocol.HeaderLen); err != nil {
+		recip.disconnect()
+		if _, err := sender.Write(protocol.EncodeSendErrorResponse(reqID)); err != nil {
+			return fmt.Errorf("send response: %w", err)
+		}
+		return nil
+	}
+
+	return nil
 }
 
 func (r *router) auth(timeout time.Duration, conn net.Conn) (id [protocol.ClientIDSize]byte, err error) {
@@ -264,4 +259,14 @@ func (c *conn) Inbox(conn net.Conn, maxInputSize int) <-chan []byte {
 	}()
 
 	return out
+}
+
+func (c *conn) Write(b []byte) (int, error) {
+	c.sendMu.Lock()
+	defer c.sendMu.Unlock()
+
+	c.conn.SetWriteDeadline(time.Now().Add(c.writeTimeout))
+	defer c.conn.SetWriteDeadline(time.Time{})
+
+	return c.conn.Write(b)
 }

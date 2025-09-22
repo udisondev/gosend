@@ -205,8 +205,8 @@ func (c *Client) initiateConnection(peerID [protocol.ClientIDSize]byte, hexID st
 	}
 
 	reqLogID := generateReqLogID()
-	o := protocol.Outcome{
-		ReqLogID:    reqLogID,
+	o := protocol.FromClient{
+		RequestID:   reqLogID,
 		RecipientID: peerID,
 		Payload:     payload,
 	}
@@ -309,8 +309,8 @@ func (c *Client) handleNewOffer(senderID [protocol.ClientIDSize]byte, msg Signal
 	}
 
 	reqLogID := generateReqLogID()
-	o := protocol.Outcome{
-		ReqLogID:    reqLogID,
+	o := protocol.FromClient{
+		RequestID:   reqLogID,
 		RecipientID: senderID,
 		Payload:     payload,
 	}
@@ -349,8 +349,8 @@ func (c *Client) setupPC(pc *webrtc.PeerConnection, peer *Peer) {
 		}
 
 		reqLogID := generateReqLogID()
-		o := protocol.Outcome{
-			ReqLogID:    reqLogID,
+		o := protocol.FromClient{
+			RequestID:   reqLogID,
 			RecipientID: peer.id,
 			Payload:     payload,
 		}
